@@ -482,7 +482,7 @@ if __name__ == '__main__':
     
  
     parser.add_argument('--data-dir', type=str, metavar='PATH',
-                        default='/home/xiong_ruizhuo/data/PRID/')
+                        default='/home/xiong_project/data/PRID/')
     parser.add_argument('--logs-dir', type=str, metavar='PATH',
                         default=osp.join('../logs/try'))
 
