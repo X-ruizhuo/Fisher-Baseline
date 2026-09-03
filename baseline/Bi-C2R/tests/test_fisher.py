@@ -11,6 +11,7 @@ if PROJECT_ROOT not in sys.path:
 
 from reid.utils.fisher import (  # noqa: E402
     estimate_fisher,
+    fisher_aware_state_dict_fusion,
     fisher_consolidation_loss,
     merge_fisher,
     normalize_fisher,
@@ -84,3 +85,59 @@ def test_new_classifier_rows_are_not_consolidated():
 
     assert torch.allclose(model.classifier.weight.grad[1], torch.zeros(2))
     assert torch.any(model.classifier.weight.grad[0] != 0)
+
+def test_fisher_aware_dff_beta_zero_matches_original_dff():
+    current = {"module.base.weight": torch.tensor([2.0, 4.0])}
+    old = {"module.base.weight": torch.tensor([0.0, 0.0])}
+    fisher = {"module.base.weight": torch.tensor([1.0, 10.0])}
+
+    fused = fisher_aware_state_dict_fusion(
+        current, old, fisher, alpha=0.25, beta=0.0
+    )
+
+    assert torch.allclose(
+        fused["module.base.weight"], torch.tensor([0.5, 1.0])
+    )
+
+
+def test_fisher_aware_dff_protects_high_importance_parameters_more():
+    current = {"module.base.weight": torch.tensor([2.0, 2.0])}
+    old = {"module.base.weight": torch.tensor([0.0, 0.0])}
+    fisher = {"module.base.weight": torch.tensor([0.0, 9.0])}
+
+    fused = fisher_aware_state_dict_fusion(
+        current, old, fisher, alpha=0.5, beta=1.0
+    )
+
+    assert fused["module.base.weight"][1] < fused["module.base.weight"][0]
+    assert torch.allclose(fused["module.base.weight"][0], torch.tensor(1.0))
+    assert torch.allclose(fused["module.base.weight"][1], torch.tensor(0.1))
+
+
+def test_fisher_aware_dff_keeps_new_classifier_rows():
+    current = {
+        "module.classifier.weight": torch.tensor(
+            [[2.0, 2.0], [4.0, 4.0], [8.0, 8.0]]
+        )
+    }
+    old = {
+        "module.classifier.weight": torch.tensor(
+            [[0.0, 0.0], [0.0, 0.0]]
+        )
+    }
+    fisher = {
+        "module.classifier.weight": torch.ones(2, 2)
+    }
+
+    fused = fisher_aware_state_dict_fusion(
+        current, old, fisher, alpha=0.5, beta=1.0
+    )
+
+    assert torch.allclose(
+        fused["module.classifier.weight"][:2],
+        current["module.classifier.weight"][:2] * 0.25,
+    )
+    assert torch.equal(
+        fused["module.classifier.weight"][2],
+        current["module.classifier.weight"][2],
+    )

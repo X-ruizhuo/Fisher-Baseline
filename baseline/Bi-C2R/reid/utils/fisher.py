@@ -222,3 +222,70 @@ def load_fisher_checkpoint(path, map_location="cpu"):
     if "fisher" not in payload:
         raise KeyError("Fisher checkpoint 缺少 fisher 字段: {}".format(path))
     return payload
+
+def fisher_aware_state_dict_fusion(current_state, old_state, old_fisher,
+                                    alpha, beta=1.0):
+    """基于历史 Fisher 执行参数级 DFF 融合。
+
+    alpha 由 baseline 原有 DFF 根据当前阶段新旧特征关系计算，beta 控制
+    Fisher 对参数融合强度。高 Fisher 参数更接近旧模型，低 Fisher 参数
+    保留更多当前模型更新；扩展 classifier 的新身份行始终保留当前模型。
+    """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha 必须位于 [0, 1] 区间")
+    if beta < 0:
+        raise ValueError("beta 不能小于 0")
+
+    fused_state = {}
+    for name, current_value in current_state.items():
+        # 非参数 buffer（例如 BN running statistics）没有 Fisher，保持原 DFF
+        # 的行为；只有同名且形状兼容的旧状态才进行融合。
+        if name not in old_state:
+            fused_state[name] = current_value.clone()
+            continue
+
+        old_value = old_state[name].to(current_value.device)
+        # num_batches_tracked 等整数 buffer 不具备连续参数含义，不能做
+        # 浮点线性组合；保留当前模型状态可避免 dtype 冲突。
+        if not current_value.is_floating_point():
+            fused_state[name] = current_value.clone()
+            continue
+        if name not in old_fisher:
+            if old_value.shape == current_value.shape:
+                fused_state[name] = alpha * current_value + (1.0 - alpha) * old_value
+            else:
+                fused_state[name] = current_value.clone()
+            continue
+
+        fisher_value = old_fisher[name].to(current_value.device).float()
+        if old_value.shape == current_value.shape:
+            # Fisher 归一化后，alpha_F 仍落在 [0, alpha]，避免数值异常导致
+            # 融合结果偏离新旧模型参数区间。
+            alpha_fisher = alpha / (1.0 + beta * fisher_value)
+            alpha_fisher = alpha_fisher.clamp(0.0, 1.0).to(current_value.dtype)
+            fused_state[name] = (
+                alpha_fisher * current_value
+                + (1.0 - alpha_fisher) * old_value
+            )
+            continue
+
+        # 分类器只沿第 0 维扩展。旧身份行使用 Fisher-aware DFF，新身份行
+        # 没有历史参数和历史 Fisher，必须完整保留当前模型结果。
+        if _is_classifier_name(name) and old_value.ndim == current_value.ndim:
+            if old_value.shape[1:] != current_value.shape[1:] or old_value.shape[0] > current_value.shape[0]:
+                raise ValueError("classifier 状态形状不兼容: {}".format(name))
+            fused_value = current_value.clone()
+            old_rows = old_value.shape[0]
+            alpha_fisher = alpha / (1.0 + beta * fisher_value[:old_rows])
+            alpha_fisher = alpha_fisher.clamp(0.0, 1.0).to(current_value.dtype)
+            fused_value[:old_rows] = (
+                alpha_fisher * current_value[:old_rows]
+                + (1.0 - alpha_fisher) * old_value
+            )
+            fused_state[name] = fused_value
+            continue
+
+        raise ValueError("参数状态形状不兼容: {}: {} vs {}".format(
+            name, tuple(old_value.shape), tuple(current_value.shape)))
+
+    return fused_state

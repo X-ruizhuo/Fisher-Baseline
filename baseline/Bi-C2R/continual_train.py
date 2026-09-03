@@ -18,7 +18,7 @@ from reid.utils.feature_tools import *
 from reid.models.layers import DataParallel
 from reid.models.resnet import make_model, TransNet_adaptive
 from reid.trainer import Trainer
-from reid.utils.fisher import estimate_fisher, normalize_fisher, merge_fisher, save_fisher_checkpoint, snapshot_parameters
+from reid.utils.fisher import estimate_fisher, normalize_fisher, merge_fisher, save_fisher_checkpoint, snapshot_parameters, fisher_aware_state_dict_fusion
 from torch.utils.tensorboard import SummaryWriter
 
 from lreid_dataset.datasets.get_data_loaders import build_data_loaders
@@ -34,6 +34,12 @@ def worker_init_fn(worked_id):
 
 def main():
     args = parser.parse_args()
+
+    # Fisher-aware DFF 必须依赖上一阶段 Fisher；显式校验可避免静默回退。
+    if args.use_fisher_dff and not args.use_fisher:
+        parser.error("Fisher-aware DFF 依赖历史 Fisher，请同时指定 --use-fisher")
+    if args.fisher_dff_beta < 0:
+        parser.error("--fisher-dff-beta 不能小于 0")
 
     if args.seed is not None:
         np.random.seed(args.seed) 
@@ -70,7 +76,7 @@ def main_worker(args, cfg):
 
     """
     loading the datasets:
-    setting锛?1 or 2 
+    setting閿?1 or 2 
     """
     if 1 == args.setting:
         training_set = ['market1501', 'cuhk_sysu', 'dukemtmc', 'msmt17', 'cuhk03']
@@ -110,7 +116,6 @@ def main_worker(args, cfg):
                          
             best_alpha = get_adaptive_alpha(args, model, model_old, all_train_sets, step + 1)
             model = linear_combination(args, model, model_old, best_alpha)
-
             save_name = '{}_checkpoint_adaptive_ema_{:.4f}.pth.tar'.format(training_set[step+1], best_alpha)
             save_checkpoint({
                 'state_dict': model.state_dict(),
@@ -135,8 +140,8 @@ def main_worker(args, cfg):
 
     previous_fisher = None
     for set_index in range(0, len(training_set)):
-        # 参数快照必须在当前阶段 classifier 扩展前获取，作为历史模型的
-        # 固化锚点；old_model 则继续承担 Bi-C2R 原有蒸馏职责。
+        # classifier 扩展前保存上一阶段部署参数，作为本阶段 Fisher 固化锚点。
+        # old_model 继续用于 Bi-C2R 蒸馏，两者职责相互独立。
         old_params = snapshot_parameters(model) if set_index > 0 else None
         old_fisher = previous_fisher if set_index > 0 else None
         model_old = copy.deepcopy(model)
@@ -148,11 +153,26 @@ def main_worker(args, cfg):
 
         if set_index > 0:
             best_alpha = get_adaptive_alpha(args, model, model_old, all_train_sets, set_index)
-            model = linear_combination(args, model, model_old, best_alpha)
+            if args.use_fisher and args.use_fisher_dff and old_fisher is not None:
+                # 原始 DFF 的全局 alpha 表示阶段级兼容性；Historical Fisher
+                # 将其细化为参数级融合系数，使重要历史参数更接近旧模型。
+                fused_state = fisher_aware_state_dict_fusion(
+                    model.state_dict(),
+                    model_old.state_dict(),
+                    old_fisher,
+                    alpha=best_alpha,
+                    beta=args.fisher_dff_beta,
+                )
+                model.load_state_dict(fused_state)
+                print("Applied Fisher-aware DFF: alpha={:.6f}, beta={:.6f}".format(
+                    best_alpha, args.fisher_dff_beta
+                ))
+            else:
+                model = linear_combination(args, model, model_old, best_alpha)
 
         dataset, num_classes, train_loader, test_loader, init_loader, name = all_train_sets[set_index]
 
-        # DFF 完成后统计 Fisher，确保它与本阶段最终部署模型严格对应。
+        # 必须在 DFF 完成后统计 Fisher，确保重要性矩阵与最终部署模型一致。
         if args.use_fisher:
             fisher_new = estimate_fisher(
                 model=model,
@@ -186,7 +206,7 @@ def main_worker(args, cfg):
                     'source': 'stage_data_and_post_dff_model',
                 },
             )
-            # Fisher 和最终模型使用同一阶段编号，方便断点恢复和复现实验。
+            # 模型 checkpoint 与 Fisher 使用同一阶段编号，保证可追溯性。
             save_checkpoint({
                 'state_dict': model.state_dict(),
                 'epoch': 0,
@@ -501,22 +521,26 @@ if __name__ == '__main__':
     parser.add_argument('--weight_anti', type=float, default=1, help='weight for anti_forget loss')
     parser.add_argument('--weight_discri', type=float, default=0.007, help='weight for anti_discrimination loss')
     parser.add_argument('--weight_transx', type=float, default=0.0005, help='weight for transformation_x loss')
-    # Historical Fisher 配置。默认关闭，以保证原始 baseline 的复现实验不受影响。
-    parser.add_argument('--use-fisher', action='store_true',
-                        help='启用 Historical Fisher 参数固化')
-    parser.add_argument('--lambda-fim', type=float, default=1e-5,
-                        help='Fisher 固化损失权重')
-    parser.add_argument('--fisher-gamma', type=float, default=1.0,
-                        help='历史 Fisher 累计系数')
-    parser.add_argument('--fisher-estimator', type=str, default='per_sample',
-                        choices=['per_sample', 'batch_mean'],
-                        help='Fisher 梯度平方估计方式')
-    parser.add_argument('--fisher-norm', type=str, default='per_parameter_mean',
-                        choices=['none', 'global_mean', 'per_parameter_mean'],
-                        help='Fisher 归一化方式')
-    parser.add_argument('--fisher-clip-value', type=float, default=None,
-                        help='Fisher 最大截断值；默认不截断')
-    parser.add_argument('--fisher-max-batches', type=int, default=None,
-                        help='Fisher 统计最多使用的 batch 数；默认使用全部 batch')
-    
+    # Historical Fisher 配置默认关闭，保证原始 Bi-C2R 实验路径不变。
+    parser.add_argument("--use-fisher", action="store_true",
+                        help="启用 Historical Fisher 参数固化")
+    parser.add_argument("--lambda-fim", type=float, default=1e-5,
+                        help="Fisher 固化损失权重")
+    parser.add_argument("--fisher-gamma", type=float, default=1.0,
+                        help="历史 Fisher 在线累计系数")
+    parser.add_argument("--fisher-estimator", type=str, default="per_sample",
+                        choices=["per_sample", "batch_mean"],
+                        help="Fisher 梯度平方估计方式")
+    parser.add_argument("--fisher-norm", type=str, default="per_parameter_mean",
+                        choices=["none", "global_mean", "per_parameter_mean"],
+                        help="Fisher 归一化方式")
+    parser.add_argument("--fisher-clip-value", type=float, default=None,
+                        help="Fisher 最大截断值；默认不截断")
+    parser.add_argument("--fisher-max-batches", type=int, default=None,
+                        help="Fisher 统计最多使用的 batch 数；默认使用全部 batch")
+    parser.add_argument("--use-fisher-dff", action="store_true",
+                        help="使用 Fisher-aware DFF 进行参数级模型融合")
+    parser.add_argument("--fisher-dff-beta", type=float, default=1.0,
+                        help="Fisher-aware DFF 的参数重要性调节系数")
+
     main()
